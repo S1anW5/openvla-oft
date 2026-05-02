@@ -153,4 +153,6 @@ class PaddedCollatorForActionPrediction:
         )
         if dataset_names is not None:
             output["dataset_names"] = dataset_names
+        if "frame_weight" in instances[0]:
+            output["frame_weights"] = torch.stack([instance["frame_weight"] for instance in instances])
         return output

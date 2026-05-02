@@ -183,8 +183,42 @@ class RLDSDataset(IterableDataset):
         raise NotImplementedError("IterableDataset does not implement map-style __getitem__; see __iter__ instead!")
 
 
+class WeightedRLDSDataset(RLDSDataset):
+    """RLDSDataset subclass that attaches per-frame uncertainty weights to each sample.
+
+    Weights are loaded from a .npz file produced by compute_ensemble_uncertainty.py.
+    Frame identity is (episode_idx, step_idx): episode_idx increments each time timestep resets
+    to 0, and step_idx is observation["timestep"][0] from the RLDS pipeline.
+
+    Requires shuffle_buffer_size=1 (no shuffle) for deterministic episode ordering.
+    """
+
+    def __init__(self, *args, weight_file: str, default_weight: float = 1.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        data = np.load(weight_file)
+        self.weight_table = {
+            (int(ep), int(st)): float(w)
+            for ep, st, w in zip(data["episode_indices"], data["step_indices"], data["weights"])
+        }
+        self.default_weight = default_weight
+
+    def __iter__(self):
+        episode_idx = 0
+        prev_step = None
+        for rlds_batch in self.dataset.as_numpy_iterator():
+            current_step = int(rlds_batch["observation"]["timestep"][0])
+            if prev_step is not None and current_step == 0:
+                episode_idx += 1
+            prev_step = current_step
+            sample = self.batch_transform(rlds_batch)
+            sample["frame_weight"] = torch.tensor(
+                self.weight_table.get((episode_idx, current_step), self.default_weight),
+                dtype=torch.float32,
+            )
+            yield sample
+
+
 class EpisodicRLDSDataset(RLDSDataset):
-    """Returns full episodes as list of steps instead of individual transitions (useful for visualizations)."""
 
     def make_dataset(self, rlds_config):
         per_dataset_kwargs = rlds_config["dataset_kwargs_list"]

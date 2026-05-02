@@ -106,9 +106,9 @@ class FinetuneConfig:
     use_lora: bool = True                            # If True, uses LoRA fine-tuning
     lora_rank: int = 32                              # Rank of LoRA weight matrix
     lora_dropout: float = 0.0                        # Dropout applied to LoRA weights
-    merge_lora_during_training: bool = True          # If True, merges LoRA weights and saves result during training
-                                                     #   Note: Merging can be very slow on some machines. If so, set to
-                                                     #         False and merge final checkpoint offline!
+    merge_lora_during_training: bool = False         # If True, merges LoRA weights and saves result during training
+                                                     #   Note: Merging loads a second copy of the base model (~14GB),
+                                                     #         which will OOM on a 24GB GPU. Merge offline instead!
 
     # Logging
     wandb_entity: str = "your-wandb-entity"          # Name of WandB entity
@@ -118,6 +118,11 @@ class FinetuneConfig:
     wandb_log_freq: int = 10                         # WandB logging frequency in steps
 
     # fmt: on
+
+    # Ensemble / uncertainty weighting
+    seed: int = 42                                   # Random seed for reproducibility across ensemble members
+    use_gradient_checkpointing: bool = True          # Enable gradient checkpointing to save VRAM (required on 24GB GPU)
+    uncertainty_weight_file: Optional[str] = None   # Path to .npz per-frame uncertainty weights (from analyze_uncertainty.py)
 
 
 def remove_ddp_in_checkpoint(state_dict) -> dict:
@@ -386,8 +391,14 @@ def run_forward_pass(
         if use_l1_regression:
             # Predict action
             predicted_actions = action_head.module.predict_action(actions_hidden_states)
-            # Get full L1 loss
-            loss = torch.nn.L1Loss()(ground_truth_actions, predicted_actions)
+            # Per-sample L1 loss, then optionally weight by per-frame uncertainty scores
+            per_sample_loss = torch.nn.L1Loss(reduction="none")(ground_truth_actions, predicted_actions)
+            per_sample_loss = per_sample_loss.mean(dim=(1, 2))  # (B,)
+            if "frame_weights" in batch and batch["frame_weights"] is not None:
+                weights = batch["frame_weights"].to(device_id).to(torch.bfloat16)
+                loss = (per_sample_loss * weights).sum() / (weights.sum() + 1e-8)
+            else:
+                loss = per_sample_loss.mean()
 
         if use_diffusion:
             # Predict noise
@@ -788,6 +799,10 @@ def finetune(cfg: FinetuneConfig) -> None:
     torch.cuda.set_device(device_id)
     torch.cuda.empty_cache()
 
+    # Set random seed for reproducibility (important for ensemble diversity)
+    from prismatic.util.torch_utils import set_global_seed
+    set_global_seed(cfg.seed)
+
     # Initialize wandb logging
     if distributed_state.is_main_process:
         wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"ft+{run_id}")
@@ -853,6 +868,10 @@ def finetune(cfg: FinetuneConfig) -> None:
         )
         vla = get_peft_model(vla, lora_config)
         vla.print_trainable_parameters()
+
+    # Enable gradient checkpointing to reduce activation memory (required for 24GB GPU)
+    if cfg.use_gradient_checkpointing:
+        vla.enable_gradient_checkpointing()
 
     # FiLM setup
     if cfg.use_film:
@@ -983,6 +1002,17 @@ def finetune(cfg: FinetuneConfig) -> None:
         shuffle_buffer_size=cfg.shuffle_buffer_size,
         image_aug=cfg.image_aug,
     )
+    if cfg.uncertainty_weight_file is not None:
+        from prismatic.vla.datasets import WeightedRLDSDataset
+        train_dataset = WeightedRLDSDataset(
+            cfg.data_root_dir,
+            cfg.dataset_name,
+            batch_transform,
+            resize_resolution=tuple(vla.module.config.image_sizes),
+            shuffle_buffer_size=1,  # disable shuffle for deterministic weight lookup
+            image_aug=cfg.image_aug,
+            weight_file=cfg.uncertainty_weight_file,
+        )
     if cfg.use_val_set:
         val_dataset = RLDSDataset(
             cfg.data_root_dir,
