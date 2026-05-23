@@ -578,6 +578,7 @@ def make_interleaved_dataset(
 
     # Note =>> Seems to reduce memory usage without affecting speed?
     dataset = dataset.with_ram_budget(1)
+    dataset = dataset.prefetch(tf.data.AUTOTUNE)
 
     # Save for Later
     dataset.sample_weights = sample_weights
