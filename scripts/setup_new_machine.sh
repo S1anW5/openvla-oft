@@ -17,6 +17,7 @@ CONDA_ENV=openvla-oft
 
 # ── Chinese mirrors ───────────────────────────────────────────────
 PIP_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple
+GITHUB_PROXY=https://ghproxy.com/
 export HF_ENDPOINT=https://hf-mirror.com
 export PIP_INDEX_URL=$PIP_MIRROR
 export PIP_EXTRA_INDEX_URL=$PIP_MIRROR
@@ -43,7 +44,7 @@ conda activate $CONDA_ENV
 echo ""
 echo "[2/6] Cloning repo..."
 if [ ! -d "/root/openvla-oft" ]; then
-    git clone https://github.com/S1anW5/openvla-oft.git /root/openvla-oft
+    git clone ${GITHUB_PROXY}https://github.com/S1anW5/openvla-oft.git /root/openvla-oft
 else
     echo "  /root/openvla-oft already exists, pulling latest..."
     git -C /root/openvla-oft pull
@@ -83,7 +84,14 @@ fi
 
 # LIBERO
 if [ ! -d "/root/LIBERO" ]; then
-    git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git /root/LIBERO
+    echo "  Cloning LIBERO (via ghproxy)..."
+    git config --global http.postBuffer 524288000
+    for attempt in 1 2 3; do
+        git clone --depth=1 ${GITHUB_PROXY}https://github.com/Lifelong-Robot-Learning/LIBERO.git /root/LIBERO && break
+        echo "  Clone attempt $attempt failed, retrying..."
+        rm -rf /root/LIBERO
+    done
+    [ -d "/root/LIBERO" ] || { echo "ERROR: LIBERO clone failed after 3 attempts"; exit 1; }
     pip install -e /root/LIBERO -q
     pip install -r /root/openvla-oft/experiments/robot/libero/libero_requirements.txt -q
 else
