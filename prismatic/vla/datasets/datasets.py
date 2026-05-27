@@ -259,3 +259,20 @@ class DummyDataset(Dataset):
         labels[: -(len(action) + 1)] = IGNORE_INDEX
 
         return dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels)
+
+
+class WeightedRLDSDataset(RLDSDataset):
+    """RLDSDataset subclass that attaches per-frame uncertainty weights baked into the RLDS data."""
+
+    def __iter__(self):
+        for rlds_batch in self.dataset.as_numpy_iterator():
+            sample = self.batch_transform(rlds_batch)
+            # frame_weight is a step-level feature (top-level, not under observation)
+            if "frame_weight" in rlds_batch:
+                fw = float(rlds_batch["frame_weight"][0])
+            elif "frame_weight" in rlds_batch.get("observation", {}):
+                fw = float(rlds_batch["observation"]["frame_weight"][0])
+            else:
+                fw = 1.0
+            sample["frame_weights"] = torch.tensor(fw, dtype=torch.float32)
+            yield sample

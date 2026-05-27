@@ -27,6 +27,7 @@ from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq,
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 import wandb
+from torch.utils.tensorboard import SummaryWriter
 
 from experiments.robot.openvla_utils import (
     check_model_logic_mismatch,
@@ -99,6 +100,7 @@ class FinetuneConfig:
                                                      #   (If False, saves all checkpoints)
     resume: bool = False                             # If True, resumes from checkpoint
     resume_step: Optional[int] = None                # (When `resume==True`) Step number that we are resuming from
+    resume_dir: Optional[str] = None                 # (When `resume==True`) Path to checkpoint dir; vla_path stays as base model
     image_aug: bool = True                           # If True, trains with image augmentations (HIGHLY RECOMMENDED)
     diffusion_sample_freq: int = 50                  # (When `use_diffusion==True`) Frequency for sampling in steps
 
@@ -111,17 +113,18 @@ class FinetuneConfig:
                                                      #         which will OOM on a 24GB GPU. Merge offline instead!
 
     # Logging
+    use_wandb: bool = False                          # Set True to enable Weights & Biases logging
     wandb_entity: str = "your-wandb-entity"          # Name of WandB entity
     wandb_project: str = "your-wandb-project"        # Name of WandB project
     run_id_note: Optional[str] = None                # Extra note to add to end of run ID for logging
     run_id_override: Optional[str] = None            # Optional string to override the run ID with
-    wandb_log_freq: int = 10                         # WandB logging frequency in steps
+    wandb_log_freq: int = 10                         # WandB/TensorBoard logging frequency in steps
 
     # fmt: on
 
     # Ensemble / uncertainty weighting
     seed: int = 42                                   # Random seed for reproducibility across ensemble members
-    use_gradient_checkpointing: bool = True          # Enable gradient checkpointing to save VRAM (required on 24GB GPU)
+    use_gradient_checkpointing: bool = False         # Gradient checkpointing conflicts with DDP find_unused_parameters
     uncertainty_weight_file: Optional[str] = None   # Path to .npz per-frame uncertainty weights (from analyze_uncertainty.py)
 
 
@@ -165,7 +168,8 @@ def get_run_id(cfg) -> str:
         run_id = cfg.run_id_override
     elif cfg.resume:
         # Override run ID with the previous resumed run's ID
-        run_id = cfg.vla_path.split("/")[-1]
+        resume_path = cfg.resume_dir if cfg.resume_dir is not None else cfg.vla_path
+        run_id = resume_path.rstrip("/").split("/")[-1]
         # Remove the "--XXX_chkpt" suffix from the run ID if it exists
         if "chkpt" in run_id.split("--")[-1]:
             run_id = "--".join(run_id.split("--")[:-1])
@@ -261,7 +265,8 @@ def init_module(
     count_parameters(module, module_name)
 
     if cfg.resume:
-        state_dict = load_checkpoint(module_name, cfg.vla_path, cfg.resume_step)
+        ckpt_path = cfg.resume_dir if cfg.resume_dir is not None else cfg.vla_path
+        state_dict = load_checkpoint(module_name, ckpt_path, cfg.resume_step)
         module.load_state_dict(state_dict)
 
     if to_bf16:
@@ -395,8 +400,10 @@ def run_forward_pass(
             per_sample_loss = torch.nn.L1Loss(reduction="none")(ground_truth_actions, predicted_actions)
             per_sample_loss = per_sample_loss.mean(dim=(1, 2))  # (B,)
             if "frame_weights" in batch and batch["frame_weights"] is not None:
+                # weights are per-episode normalized (mean=1 within each episode),
+                # so direct multiplication preserves loss scale on average.
                 weights = batch["frame_weights"].to(device_id).to(torch.bfloat16)
-                loss = (per_sample_loss * weights).sum() / (weights.sum() + 1e-8)
+                loss = (per_sample_loss * weights).mean()
             else:
                 loss = per_sample_loss.mean()
 
@@ -558,28 +565,31 @@ def compute_smoothened_metrics(metrics_deques) -> dict:
     return smoothened_metrics
 
 
-def log_metrics_to_wandb(metrics, prefix, step, wandb_entity) -> None:
+def log_metrics_to_wandb(metrics, prefix, step, wandb_entity, tb_writer=None) -> None:
     """
-    Log metrics to Weights & Biases.
+    Log metrics to Weights & Biases and/or TensorBoard.
 
     Args:
         metrics (dict): Dictionary of metrics to log
         prefix (str): Prefix for metric names
         step (int): Training step
         wandb_entity (str): W&B entity instance
+        tb_writer: TensorBoard SummaryWriter instance (optional)
 
     Returns:
         None.
     """
     log_dict = {}
     for name, value in metrics.items():
-        # Map loss_value to Loss for better readability in W&B
         if name == "loss_value":
             log_dict[f"{prefix}/Loss"] = value
-        # Keep other metrics as is
         else:
             log_dict[f"{prefix}/{name.replace('_', ' ').title()}"] = value
-    wandb_entity.log(log_dict, step=step)
+    if wandb_entity is not None:
+        wandb_entity.log(log_dict, step=step)
+    if tb_writer is not None:
+        for k, v in log_dict.items():
+            tb_writer.add_scalar(k, v, global_step=step)
 
 
 def save_training_checkpoint(
@@ -756,9 +766,10 @@ def run_validation(
     # Add batch count to metrics
     avg_val_metrics["val_batches_count"] = val_batches_count
 
-    # Log validation metrics to W&B
+    # Log validation metrics to W&B + TensorBoard
     if distributed_state.is_main_process:
-        log_metrics_to_wandb(avg_val_metrics, "VLA Val", log_step, wandb)
+        log_metrics_to_wandb(avg_val_metrics, "VLA Val", log_step,
+                              wandb if cfg.use_wandb else None, tb_writer)
 
 
 @draccus.wrap()
@@ -803,9 +814,13 @@ def finetune(cfg: FinetuneConfig) -> None:
     from prismatic.util.torch_utils import set_global_seed
     set_global_seed(cfg.seed)
 
-    # Initialize wandb logging
+    # Initialize logging (tensorboard always; wandb optional)
     if distributed_state.is_main_process:
-        wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"ft+{run_id}")
+        if cfg.use_wandb:
+            wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"ft+{run_id}")
+        tb_writer = SummaryWriter(log_dir=str(run_dir / "tensorboard"))
+    else:
+        tb_writer = None
 
     # Print detected constants
     print(
@@ -868,10 +883,17 @@ def finetune(cfg: FinetuneConfig) -> None:
         )
         vla = get_peft_model(vla, lora_config)
         vla.print_trainable_parameters()
+        # When resuming with a separate checkpoint dir, load LoRA weights from there
+        if cfg.resume and cfg.resume_dir is not None:
+            adapter_dir = os.path.join(cfg.resume_dir, "lora_adapter")
+            vla.load_adapter(adapter_dir, adapter_name="default")
+            vla.set_adapter("default")
 
     # Enable gradient checkpointing to reduce activation memory (required for 24GB GPU)
     if cfg.use_gradient_checkpointing:
-        vla.enable_gradient_checkpointing()
+        # PeftModel 和 OpenVLAForActionPrediction 不直接暴露 enable_gradient_checkpointing，
+        # 需要通过底层 language model 开启
+        vla.model.language_model.gradient_checkpointing_enable()
 
     # FiLM setup
     if cfg.use_film:
@@ -886,12 +908,17 @@ def finetune(cfg: FinetuneConfig) -> None:
         )
         count_parameters(vla.vision_backbone, "vla.vision_backbone (post-wrap)")
         if cfg.resume:
-            state_dict = load_checkpoint("vision_backbone", cfg.vla_path, cfg.resume_step)
+            ckpt_path = cfg.resume_dir if cfg.resume_dir is not None else cfg.vla_path
+            state_dict = load_checkpoint("vision_backbone", ckpt_path, cfg.resume_step)
             vla.model.vision_backbone.load_state_dict(state_dict)
         vla.model.vision_backbone = vla.model.vision_backbone.to(device_id)
 
     # Wrap VLA with DDP
-    vla = wrap_ddp(vla, device_id, find_unused=True)
+    # gradient checkpointing 与 find_unused_parameters=True 冲突，需用 static_graph=True
+    if cfg.use_gradient_checkpointing:
+        vla = DDP(vla, device_ids=[device_id], gradient_as_bucket_view=True, static_graph=True)
+    else:
+        vla = wrap_ddp(vla, device_id, find_unused=True)
 
     # If applicable, instantiate proprio projector
     if cfg.use_proprio:
@@ -1004,14 +1031,16 @@ def finetune(cfg: FinetuneConfig) -> None:
     )
     if cfg.uncertainty_weight_file is not None:
         from prismatic.vla.datasets import WeightedRLDSDataset
+        # Weights are baked into libero_goal_no_noops_weighted/ TFRecord files;
+        # shuffle=True works correctly because each frame carries its own weight.
+        weighted_dataset_name = cfg.dataset_name + "_weighted"
         train_dataset = WeightedRLDSDataset(
             cfg.data_root_dir,
-            cfg.dataset_name,
+            weighted_dataset_name,
             batch_transform,
             resize_resolution=tuple(vla.module.config.image_sizes),
-            shuffle_buffer_size=1,  # disable shuffle for deterministic weight lookup
+            shuffle_buffer_size=cfg.shuffle_buffer_size,
             image_aug=cfg.image_aug,
-            weight_file=cfg.uncertainty_weight_file,
         )
     if cfg.use_val_set:
         val_dataset = RLDSDataset(
@@ -1099,10 +1128,11 @@ def finetune(cfg: FinetuneConfig) -> None:
             # Compute smoothened train metrics
             smoothened_metrics = compute_smoothened_metrics(recent_metrics)
 
-            # Push Metrics to W&B (every wandb_log_freq gradient steps)
+            # Push Metrics to W&B + TensorBoard (every wandb_log_freq gradient steps)
             log_step = gradient_step_idx if not cfg.resume else cfg.resume_step + gradient_step_idx
             if distributed_state.is_main_process and log_step % cfg.wandb_log_freq == 0:
-                log_metrics_to_wandb(smoothened_metrics, "VLA Train", log_step, wandb)
+                log_metrics_to_wandb(smoothened_metrics, "VLA Train", log_step,
+                                     wandb if cfg.use_wandb else None, tb_writer)
 
             # [If applicable] Linearly warm up learning rate from 10% to 100% of original
             if cfg.lr_warmup_steps > 0:
@@ -1112,14 +1142,12 @@ def finetune(cfg: FinetuneConfig) -> None:
                     param_group["lr"] = current_lr
 
             if distributed_state.is_main_process and gradient_step_idx % cfg.wandb_log_freq == 0:
-                # Log the learning rate
-                # Make sure to do this AFTER any learning rate modifications (e.g., warmup/decay)
-                wandb.log(
-                    {
-                        "VLA Train/Learning Rate": scheduler.get_last_lr()[0],
-                    },
-                    step=log_step,
-                )
+                # Log the learning rate (after any LR modifications)
+                lr_val = scheduler.get_last_lr()[0]
+                if cfg.use_wandb:
+                    wandb.log({"VLA Train/Learning Rate": lr_val}, step=log_step)
+                if tb_writer is not None:
+                    tb_writer.add_scalar("VLA Train/Learning Rate", lr_val, global_step=log_step)
 
             # Optimizer and LR scheduler step
             if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
