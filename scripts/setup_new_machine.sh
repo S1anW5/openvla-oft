@@ -47,6 +47,7 @@ if [ ! -d "/root/openvla-oft" ]; then
     git clone ${GITHUB_PROXY}https://github.com/S1anW5/openvla-oft.git /root/openvla-oft
 else
     echo "  /root/openvla-oft already exists, pulling latest..."
+    git -C /root/openvla-oft remote set-url origin ${GITHUB_PROXY}https://github.com/S1anW5/openvla-oft.git
     git -C /root/openvla-oft pull
 fi
 cd /root/openvla-oft
