@@ -5,9 +5,10 @@ Stage 1: Train K=2 LoRA adapters on a shared frozen base model with SVGD
 prediction-space repulsion. Each adapter is a "particle" pushed to be
 functionally diverse while minimising task loss.
 
-Design: ONE shared action_head + ONE shared proprio_projector + K LoRA adapters.
-Diversity comes purely from the LoRA weights; the action head is not part of
-the ensemble.
+Design: K independent action_heads + K independent proprio_projectors + K LoRA
+adapters. Each particle has a complete, independent decision chain so that the
+shared action head cannot bias one particle's hidden-state distribution over the
+other's.
 
   L_total = (L_task_0 + L_task_1 + λ(t) · L_repulsion) / grad_accum_steps
 
@@ -112,8 +113,8 @@ class SVGDEnsembleConfig:
     use_proprio: bool               = True
 
     # Training
-    batch_size: int                 = 1       # micro-batch; two fwd passes ~32 GB
-    grad_accum_steps: int           = 8       # effective batch = batch_size * grad_accum_steps
+    batch_size: int                 = 8       # micro-batch; 96 GB GPU
+    grad_accum_steps: int           = 1       # effective batch = batch_size * grad_accum_steps
     learning_rate: float            = 5e-4
     num_steps_before_decay: int     = 40_000  # 80 % of max_steps
     max_steps: int                  = 50_000
@@ -121,6 +122,7 @@ class SVGDEnsembleConfig:
     save_latest_checkpoint_only: bool = False
     image_aug: bool                 = True
     seed: int                       = 42
+    use_compile: bool               = False   # torch.compile action_heads for ~10% speedup
 
     # LoRA
     lora_rank: int                  = 32
@@ -230,9 +232,9 @@ def forward_one_particle(
     use_proprio: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    One forward pass with the currently-active LoRA adapter.
+    One forward pass with the currently-active LoRA adapter and the
+    particle-specific action_head / proprio_projector.
     Returns (l1_loss, predicted_actions (B, chunk, action_dim)).
-    Action head and proprio projector are SHARED across particles.
     """
     gt_actions = batch["actions"].to(device_id).to(torch.bfloat16)
 
@@ -274,8 +276,8 @@ def save_checkpoint(
     step: int,
     vla,
     processor,
-    action_head: nn.Module,
-    proprio_projector: Optional[nn.Module],
+    action_heads: List[nn.Module],
+    proprio_projectors: List[Optional[nn.Module]],
     train_dataset,
     optimizer,
     scheduler,
@@ -290,18 +292,23 @@ def save_checkpoint(
     processor.save_pretrained(ckpt_dir)
     save_dataset_statistics(train_dataset.dataset_statistics, ckpt_dir)
 
-    # Save each LoRA adapter independently (selected_adapters prevents mixing)
+    # Save each LoRA adapter independently
     for k in range(cfg.num_particles):
         adapter_dir = ckpt_dir / f"lora_{k}"
         adapter_dir.mkdir(exist_ok=True)
         vla.save_pretrained(str(adapter_dir), selected_adapters=[f"lora_{k}"])
 
-    # Shared components (single copy)
-    torch.save(action_head.state_dict(),
-               ckpt_dir / f"action_head--{step}_checkpoint.pt")
-    if cfg.use_proprio and proprio_projector is not None:
-        torch.save(proprio_projector.state_dict(),
-                   ckpt_dir / f"proprio_projector--{step}_checkpoint.pt")
+    # Save per-particle action_head and proprio_projector
+    for k in range(cfg.num_particles):
+        torch.save(
+            action_heads[k].state_dict(),
+            ckpt_dir / f"action_head_{k}--{step}_checkpoint.pt",
+        )
+        if cfg.use_proprio and proprio_projectors[k] is not None:
+            torch.save(
+                proprio_projectors[k].state_dict(),
+                ckpt_dir / f"proprio_projector_{k}--{step}_checkpoint.pt",
+            )
 
     # Full training state for resume
     torch.save(
@@ -325,8 +332,8 @@ def save_checkpoint(
 
 def sanity_check_diversity(
     vla,
-    action_head: nn.Module,
-    proprio_projector: Optional[nn.Module],
+    action_heads: List[nn.Module],
+    proprio_projectors: List[Optional[nn.Module]],
     batch: dict,
     device_id: int,
     num_patches: int,
@@ -339,7 +346,7 @@ def sanity_check_diversity(
         for k in range(2):
             vla.set_adapter(f"lora_{k}")
             _, pred = forward_one_particle(
-                vla, action_head, proprio_projector,
+                vla, action_heads[k], proprio_projectors[k],
                 batch, device_id, num_patches, use_proprio,
             )
             preds.append(pred.float())
@@ -398,7 +405,7 @@ def train(cfg: SVGDEnsembleConfig) -> None:
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
         trust_remote_code=True,
-        attn_implementation="eager",
+        attn_implementation="sdpa",
     ).to(device_id)
 
     # Must set BEFORE PEFT wrapping (vision_backbone inaccessible after)
@@ -426,20 +433,30 @@ def train(cfg: SVGDEnsembleConfig) -> None:
     lora_params = sum(p.numel() for p in vla.parameters() if p.requires_grad)
     print(f"LoRA trainable params ({cfg.num_particles} adapters): {lora_params:,}")
 
-    # ── Shared action head and proprio projector ──────────────────────────────
-    # One instance shared across all particles; ensemble diversity is purely
-    # from the LoRA adapters, not from the action head or proprio projector.
+    # ── Per-particle action heads and proprio projectors ──────────────────────
     llm_dim = vla.model.language_model.config.hidden_size
-    action_head = (
-        L1RegressionActionHead(input_dim=llm_dim, hidden_dim=llm_dim, action_dim=ACTION_DIM)
-        .to(torch.bfloat16)
-        .to(device_id)
-    )
-    proprio_projector = (
-        ProprioProjector(llm_dim=llm_dim, proprio_dim=PROPRIO_DIM).to(device_id)
-        if cfg.use_proprio
-        else None
-    )
+
+    action_heads: List[nn.Module] = []
+    proprio_projectors: List[Optional[nn.Module]] = []
+
+    for k in range(cfg.num_particles):
+        ah = (
+            L1RegressionActionHead(input_dim=llm_dim, hidden_dim=llm_dim, action_dim=ACTION_DIM)
+            .to(torch.bfloat16)
+            .to(device_id)
+        )
+        if cfg.use_compile:
+            ah = torch.compile(ah)
+        action_heads.append(ah)
+
+        pp = (
+            ProprioProjector(llm_dim=llm_dim, proprio_dim=PROPRIO_DIM).to(device_id)
+            if cfg.use_proprio
+            else None
+        )
+        proprio_projectors.append(pp)
+
+    print(f"Created {cfg.num_particles} independent action_heads and proprio_projectors")
 
     # ── Number of vision patches ──────────────────────────────────────────────
     NUM_PATCHES = (
@@ -452,9 +469,10 @@ def train(cfg: SVGDEnsembleConfig) -> None:
 
     # ── Optimizer ────────────────────────────────────────────────────────────
     trainable = [p for p in vla.parameters() if p.requires_grad]
-    trainable += list(action_head.parameters())
-    if cfg.use_proprio and proprio_projector is not None:
-        trainable += list(proprio_projector.parameters())
+    for k in range(cfg.num_particles):
+        trainable += list(action_heads[k].parameters())
+        if cfg.use_proprio and proprio_projectors[k] is not None:
+            trainable += list(proprio_projectors[k].parameters())
     print(f"Total trainable params: {sum(p.numel() for p in trainable):,}")
 
     optimizer = AdamW(trainable, lr=cfg.learning_rate)
@@ -512,9 +530,10 @@ def train(cfg: SVGDEnsembleConfig) -> None:
 
     # ── Train ────────────────────────────────────────────────────────────────
     vla.train()
-    action_head.train()
-    if proprio_projector is not None:
-        proprio_projector.train()
+    for k in range(cfg.num_particles):
+        action_heads[k].train()
+        if proprio_projectors[k] is not None:
+            proprio_projectors[k].train()
 
     optimizer.zero_grad()
     global_step = 0
@@ -526,14 +545,14 @@ def train(cfg: SVGDEnsembleConfig) -> None:
         for batch in prefetch_loader:
             micro_step += 1
 
-            # ── K forward passes (shared action_head, different LoRA) ─────────
+            # ── K forward passes (per-particle action_head, different LoRA) ───
             task_losses: List[torch.Tensor] = []
             all_preds: List[torch.Tensor] = []
 
             for k in range(cfg.num_particles):
                 vla.set_adapter(f"lora_{k}")
                 loss_k, pred_k = forward_one_particle(
-                    vla, action_head, proprio_projector,
+                    vla, action_heads[k], proprio_projectors[k],
                     batch, device_id, NUM_PATCHES, cfg.use_proprio,
                 )
                 task_losses.append(loss_k)
@@ -630,14 +649,14 @@ def train(cfg: SVGDEnsembleConfig) -> None:
                 # Sanity check at step 100: B should be non-zero after 100 effective steps
                 if global_step == 100:
                     sanity_check_diversity(
-                        vla, action_head, proprio_projector,
+                        vla, action_heads, proprio_projectors,
                         batch, device_id, NUM_PATCHES, cfg.use_proprio, global_step,
                     )
 
                 if global_step % cfg.save_freq == 0:
                     save_checkpoint(
                         cfg, run_dir, global_step, vla, processor,
-                        action_head, proprio_projector, train_dataset,
+                        action_heads, proprio_projectors, train_dataset,
                         optimizer, scheduler, h_ema,
                     )
 
@@ -650,7 +669,7 @@ def train(cfg: SVGDEnsembleConfig) -> None:
 
     save_checkpoint(
         cfg, run_dir, global_step, vla, processor,
-        action_head, proprio_projector, train_dataset,
+        action_heads, proprio_projectors, train_dataset,
         optimizer, scheduler, h_ema,
     )
     print("Training complete.")
