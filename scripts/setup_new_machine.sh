@@ -45,12 +45,30 @@ cd /root/openvla-oft
 # ── 3. install dependencies ──────────────────────────────────────
 echo ""
 echo "[3/6] Installing dependencies..."
+
+# Install PyTorch with CUDA 12.8 support (required for Blackwell RTX PRO 6000)
+if ! python -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
+    echo "  Installing PyTorch (CUDA 12.8)..."
+    pip install torch torchvision torchaudio \
+        --index-url https://download.pytorch.org/whl/cu128 -q
+else
+    echo "  PyTorch already installed: $(python -c 'import torch; print(torch.__version__)')"
+fi
+
 pip install -e . -q
 
-# Flash Attention (skip if already installed)
+# Flash Attention: not required (training uses attn_implementation=sdpa).
+# Skip on Blackwell (SM_120) since flash-attn 2.5.5 does not support it.
+GPU_ARCH=$(python -c "import torch; print(torch.cuda.get_device_capability()[0])" 2>/dev/null || echo "0")
 if ! python -c "import flash_attn" 2>/dev/null; then
-    pip install packaging ninja -q
-    pip install "flash-attn==2.5.5" --no-build-isolation -q
+    if [ "$GPU_ARCH" -ge 12 ] 2>/dev/null; then
+        echo "  Skipping flash_attn on Blackwell (SM_${GPU_ARCH}x) — sdpa is used instead"
+    else
+        echo "  Installing flash_attn..."
+        pip install packaging ninja -q
+        pip install "flash-attn==2.5.5" --no-build-isolation -q || \
+            echo "  flash_attn install failed — training will use sdpa (fine)"
+    fi
 else
     echo "  flash_attn already installed"
 fi
