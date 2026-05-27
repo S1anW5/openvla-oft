@@ -15,17 +15,18 @@ DATASET=${1:-all}
 AUTODL=/root/autodl-tmp
 CONDA_ENV=openvla-oft
 
-# ── Chinese mirrors ───────────────────────────────────────────────
+# ── AutoDL network acceleration (GitHub + HuggingFace) ───────────
+[ -f /etc/network_turbo ] && source /etc/network_turbo && echo "  AutoDL network_turbo enabled"
+
+# ── pip mirror (Tsinghua) ─────────────────────────────────────────
 PIP_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple
 GITHUB_PROXY=https://ghproxy.com/
-export HF_ENDPOINT=https://hf-mirror.com
 export PIP_INDEX_URL=$PIP_MIRROR
 export PIP_EXTRA_INDEX_URL=$PIP_MIRROR
 
 echo "============================================================"
 echo "  OpenVLA-OFT setup  |  dataset=$DATASET"
 echo "  pip mirror : $PIP_MIRROR"
-echo "  HF mirror  : $HF_ENDPOINT"
 echo "============================================================"
 
 # ── 1. conda environment ─────────────────────────────────────────
