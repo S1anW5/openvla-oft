@@ -117,6 +117,7 @@ class SVGDEnsembleConfig:
     image_aug: bool                 = True
     seed: int                       = 42
     use_compile: bool               = False   # torch.compile action_heads for ~10% speedup
+    use_gradient_checkpointing: bool = False  # 省显存（backward 时重算 activation），速度降约 20~30%
 
     # LoRA
     lora_rank: int                  = 32
@@ -400,6 +401,11 @@ def train(cfg: SVGDEnsembleConfig) -> None:
 
     # Must set BEFORE PEFT wrapping (vision_backbone inaccessible after)
     vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
+
+    if cfg.use_gradient_checkpointing:
+        vla.enable_input_require_grads()
+        vla.model.language_model.gradient_checkpointing_enable()
+        print("Gradient checkpointing enabled")
 
     # ── Attach K LoRA adapters with explicit per-adapter seeds ────────────────
     lora_config = LoraConfig(
