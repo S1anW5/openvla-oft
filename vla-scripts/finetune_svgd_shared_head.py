@@ -529,7 +529,7 @@ def train(cfg: SVGDEnsembleConfig) -> None:
     micro_step = 0
     t0 = time.time()
 
-    prefetch_loader = _PrefetchLoader(dataloader, buffer_size=4)
+    prefetch_loader = _PrefetchLoader(dataloader, buffer_size=32)
     with tqdm.tqdm(total=cfg.max_steps, desc="SVGD-LoRA") as pbar:
         for batch in prefetch_loader:
             micro_step += 1
