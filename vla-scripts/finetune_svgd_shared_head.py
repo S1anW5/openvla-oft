@@ -128,6 +128,7 @@ class SVGDEnsembleConfig:
     svgd_lambda: float              = 0.1     # λ_max
     lambda_warmup_steps: int        = 5_000   # effective steps with λ=0
     lambda_ramp_steps: int          = 5_000   # effective steps to ramp 0→λ_max
+    rep_fraction_cap: float         = 0.2     # repulsion 最多占 task loss 的此比例（动态限制λ）
 
     # Logging
     use_wandb: bool                 = False
@@ -567,12 +568,16 @@ def train(cfg: SVGDEnsembleConfig) -> None:
             loss_task_sum = sum(task_losses)
 
             if lam > 0.0:
-                # Only build repulsion computation graph when λ > 0
                 loss_rep, k_val = compute_repulsion(all_preds[0], all_preds[1], h_ema)
-                loss_total = (loss_task_sum + lam * loss_rep) / cfg.grad_accum_steps
+                # 动态限制：repulsion 最多占 task loss 的 rep_fraction_cap
+                with torch.no_grad():
+                    max_lam = cfg.rep_fraction_cap * loss_task_sum.item() / max(loss_rep.item(), 1e-8)
+                lam_eff = min(lam, max_lam)
+                loss_total = (loss_task_sum + lam_eff * loss_rep) / cfg.grad_accum_steps
             else:
                 loss_rep = torch.zeros(1, device=all_preds[0].device)
                 k_val = float(torch.exp(torch.tensor(-d_sq_val / max(h_ema, 1e-6))))
+                lam_eff = 0.0
                 loss_total = loss_task_sum / cfg.grad_accum_steps
 
             loss_total.backward()
@@ -602,7 +607,7 @@ def train(cfg: SVGDEnsembleConfig) -> None:
                 recent["kernel_value"].append(k_val)
                 recent["dist_sq"].append(d_sq_val)
                 recent["h_ema"].append(h_ema)
-                recent["lambda"].append(lam)
+                recent["lambda"].append(lam_eff)
                 recent["pred_diversity"].append(diversity)
                 recent["grad_norm_lora_0"].append(gn0)
                 recent["grad_norm_lora_1"].append(gn1)
@@ -612,7 +617,7 @@ def train(cfg: SVGDEnsembleConfig) -> None:
                     "task": f"{loss_task_avg:.4f}",
                     "rep": f"{loss_rep.item():.4f}",
                     "div": f"{diversity:.4f}",
-                    "λ": f"{lam:.3f}",
+                    "λ": f"{lam_eff:.3f}",
                 })
 
                 if global_step % cfg.wandb_log_freq == 0:
@@ -626,7 +631,7 @@ def train(cfg: SVGDEnsembleConfig) -> None:
                         f"Δ={log['task_loss_diff']:.4f})  "
                         f"rep={log['loss_repulsion']:.4f}  "
                         f"k={log['kernel_value']:.4f}  h={log['h_ema']:.4f}  "
-                        f"λ={log['lambda']:.3f}  div={log['pred_diversity']:.4f}  "
+                        f"λ_eff={log['lambda']:.3f}(cap={cfg.rep_fraction_cap})  div={log['pred_diversity']:.4f}  "
                         f"lr={current_lr:.2e}  ({log['steps_per_sec']:.2f} it/s)"
                     )
                     if cfg.use_wandb:
