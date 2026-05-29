@@ -402,11 +402,6 @@ def train(cfg: SVGDEnsembleConfig) -> None:
     # Must set BEFORE PEFT wrapping (vision_backbone inaccessible after)
     vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
 
-    if cfg.use_gradient_checkpointing:
-        vla.enable_input_require_grads()
-        vla.model.language_model.gradient_checkpointing_enable()
-        print("Gradient checkpointing enabled")
-
     # ── Attach K LoRA adapters with explicit per-adapter seeds ────────────────
     lora_config = LoraConfig(
         r=cfg.lora_rank,
@@ -426,6 +421,11 @@ def train(cfg: SVGDEnsembleConfig) -> None:
 
     # PEFT's add_adapter freezes non-active adapters; re-enable all before optimizer
     enable_all_lora_params(vla)
+
+    if cfg.use_gradient_checkpointing:
+        vla.enable_input_require_grads()  # required for gradient checkpointing with LoRA
+        vla.base_model.model.language_model.gradient_checkpointing_enable()
+        print("Gradient checkpointing enabled")
     lora_params = sum(p.numel() for p in vla.parameters() if p.requires_grad)
     print(f"LoRA trainable params ({cfg.num_particles} adapters): {lora_params:,}")
 
