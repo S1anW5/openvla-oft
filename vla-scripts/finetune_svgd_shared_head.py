@@ -126,8 +126,8 @@ class SVGDEnsembleConfig:
 
     # SVGD
     svgd_lambda: float              = 0.1     # λ_max
-    lambda_warmup_steps: int        = 5_000   # effective steps with λ=0
-    lambda_ramp_steps: int          = 5_000   # effective steps to ramp 0→λ_max
+    lambda_warmup_steps: int        = 15_000  # effective steps with λ=0（让两粒子先充分收敛）
+    lambda_ramp_steps: int          = 10_000  # effective steps to ramp 0→λ_max
     rep_fraction_cap: float         = 0.2     # repulsion 最多占 task loss 的此比例（动态限制λ）
 
     # Logging
