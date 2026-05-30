@@ -532,7 +532,7 @@ def train(cfg: SVGDEnsembleConfig) -> None:
             matched_pp = list(ckpt.glob("proprio_projector--*.pt"))
             if matched_pp:
                 proprio_projector.load_state_dict(torch.load(matched_pp[0], map_location=f"cuda:{device_id}"))
-        state = torch.load(ckpt / "training_state.pt", map_location="cpu")
+        state = torch.load(ckpt / "training_state.pt", map_location="cpu", weights_only=False)
         optimizer.load_state_dict(state["optimizer"])
         scheduler.load_state_dict(state["scheduler"])
         h_ema = state["h_ema"]
