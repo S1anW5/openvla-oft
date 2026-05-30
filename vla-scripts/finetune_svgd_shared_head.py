@@ -14,6 +14,7 @@ repulsion 梯度，从而避免一个粒子性能退化的问题。
   两粒子共用 action_head(·) 和 proprio_projector(·)，多样性只来自 LoRA 权重。
 """
 
+import math
 import os
 import random
 import sys
@@ -145,6 +146,11 @@ class SVGDEnsembleConfig:
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
+
+def _sigmoid(x: float) -> float:
+    x = max(-30.0, min(30.0, x))  # clamp to avoid overflow
+    return 1.0 / (1.0 + math.exp(-x))
+
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -604,21 +610,20 @@ def train(cfg: SVGDEnsembleConfig) -> None:
 
             if lam > 0.0:
                 # Task-gated repulsion: gate_k→0 when particle k's loss deviates
+                # gate = sigmoid(-(ratio - threshold) / beta), beta is width (divisor)
                 with torch.no_grad():
                     ref = max(min(task_losses[0].item(), task_losses[1].item()), 1e-8)
-                    gate_0_val = float(torch.sigmoid(torch.tensor(
-                        -cfg.gate_beta * (task_losses[0].item() / ref - cfg.gate_threshold)
-                    )))
-                    gate_1_val = float(torch.sigmoid(torch.tensor(
-                        -cfg.gate_beta * (task_losses[1].item() / ref - cfg.gate_threshold)
-                    )))
+                    gate_0_val = _sigmoid(
+                        -(task_losses[0].item() / ref - cfg.gate_threshold) / cfg.gate_beta
+                    )
+                    gate_1_val = _sigmoid(
+                        -(task_losses[1].item() / ref - cfg.gate_threshold) / cfg.gate_beta
+                    )
                 loss_rep, k_val = compute_repulsion(
                     all_preds[0], all_preds[1], h_ema, gate_0_val, gate_1_val
                 )
-                # 动态限制：repulsion 最多占 task loss 的 rep_fraction_cap
-                with torch.no_grad():
-                    max_lam = cfg.rep_fraction_cap * loss_task_sum.item() / max(loss_rep.item(), 1e-8)
-                lam_eff = min(lam, max_lam)
+                # gate already controls per-particle repulsion; use lam directly (no cap)
+                lam_eff = lam
                 loss_total = (loss_task_sum + lam_eff * loss_rep) / cfg.grad_accum_steps
             else:
                 loss_rep = torch.zeros(1, device=all_preds[0].device)
@@ -682,7 +687,7 @@ def train(cfg: SVGDEnsembleConfig) -> None:
                         f"Δ={log['task_loss_diff']:.4f})  "
                         f"rep={log['loss_repulsion']:.4f}  "
                         f"k={log['kernel_value']:.4f}  h={log['h_ema']:.4f}  "
-                        f"λ_eff={log['lambda']:.3f}(cap={cfg.rep_fraction_cap})  div={log['pred_diversity']:.4f}  "
+                        f"λ_eff={log['lambda']:.3f}  div={log['pred_diversity']:.4f}  "
                         f"g0={log['gate_0']:.3f}  g1={log['gate_1']:.3f}  "
                         f"lr={current_lr:.2e}  ({log['steps_per_sec']:.2f} it/s)"
                     )
