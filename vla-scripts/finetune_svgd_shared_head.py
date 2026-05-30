@@ -136,6 +136,9 @@ class SVGDEnsembleConfig:
     wandb_project: str              = "openvla-svgd"
     wandb_log_freq: int             = 100
     run_id_note: Optional[str]      = None
+
+    # Resume
+    resume_dir: Optional[str]       = None  # path to a step_XXXXXXX checkpoint dir
     # fmt: on
 
 
@@ -502,8 +505,36 @@ def train(cfg: SVGDEnsembleConfig) -> None:
         pin_memory=True,
     )
 
+    # ── Resume from checkpoint ────────────────────────────────────────────────
+    start_step = 0
+    h_ema: float = 1.0
+    if cfg.resume_dir:
+        ckpt = Path(cfg.resume_dir)
+        assert ckpt.exists(), f"resume_dir not found: {ckpt}"
+        print(f"Resuming from {ckpt}")
+        for k in range(cfg.num_particles):
+            adapter_path = ckpt / f"lora_{k}" / f"lora_{k}"
+            vla.load_adapter(str(adapter_path), adapter_name=f"lora_{k}")
+        enable_all_lora_params(vla)
+        matched_head = list(ckpt.glob("action_head--*.pt"))
+        assert matched_head, f"action_head checkpoint not found in {ckpt}"
+        action_head.load_state_dict(torch.load(matched_head[0], map_location=f"cuda:{device_id}"))
+        if proprio_projector is not None:
+            matched_pp = list(ckpt.glob("proprio_projector--*.pt"))
+            if matched_pp:
+                proprio_projector.load_state_dict(torch.load(matched_pp[0], map_location=f"cuda:{device_id}"))
+        state = torch.load(ckpt / "training_state.pt", map_location="cpu")
+        optimizer.load_state_dict(state["optimizer"])
+        scheduler.load_state_dict(state["scheduler"])
+        h_ema = state["h_ema"]
+        start_step = state["step"]
+        torch.set_rng_state(state["torch_rng"])
+        torch.cuda.set_rng_state(state["cuda_rng"])
+        np.random.set_state(state["numpy_rng"])
+        random.setstate(state["python_rng"])
+        print(f"Resumed at step {start_step}, h_ema={h_ema:.4f}")
+
     # ── Training state ────────────────────────────────────────────────────────
-    h_ema: float = 1.0  # EMA bandwidth, updated every micro-batch
 
     metric_keys = [
         "loss_total", "loss_task", "loss_task_0", "loss_task_1",
@@ -525,12 +556,12 @@ def train(cfg: SVGDEnsembleConfig) -> None:
         proprio_projector.train()
 
     optimizer.zero_grad()
-    global_step = 0
+    global_step = start_step
     micro_step = 0
     t0 = time.time()
 
     prefetch_loader = _PrefetchLoader(dataloader, buffer_size=32)
-    with tqdm.tqdm(total=cfg.max_steps, desc="SVGD-LoRA") as pbar:
+    with tqdm.tqdm(total=cfg.max_steps, initial=start_step, desc="SVGD-LoRA") as pbar:
         for batch in prefetch_loader:
             micro_step += 1
 
@@ -614,7 +645,8 @@ def train(cfg: SVGDEnsembleConfig) -> None:
 
                 pbar.update()
                 pbar.set_postfix({
-                    "task": f"{loss_task_avg:.4f}",
+                    "t0": f"{loss_t0:.4f}",
+                    "t1": f"{loss_t1:.4f}",
                     "rep": f"{loss_rep.item():.4f}",
                     "div": f"{diversity:.4f}",
                     "λ": f"{lam_eff:.3f}",
