@@ -129,6 +129,8 @@ class SVGDEnsembleConfig:
     lambda_warmup_steps: int        = 15_000  # effective steps with λ=0（让两粒子先充分收敛）
     lambda_ramp_steps: int          = 10_000  # effective steps to ramp 0→λ_max
     rep_fraction_cap: float         = 0.2     # repulsion 最多占 task loss 的此比例（动态限制λ）
+    gate_threshold: float           = 1.5     # task_loss/ref 超过此倍数时关闭排斥
+    gate_beta: float                = 0.1     # sigmoid 过渡带宽度（越大越陡）
 
     # Logging
     use_wandb: bool                 = False
@@ -188,16 +190,18 @@ def compute_repulsion(
     pred_0: torch.Tensor,
     pred_1: torch.Tensor,
     h: float,
+    gate_0: float = 1.0,
+    gate_1: float = 1.0,
 ) -> Tuple[torch.Tensor, float]:
     """
-    RBF-kernel repulsion between two action-prediction tensors.
+    Task-gated RBF-kernel repulsion.
+
+    gate_k (detached scalar) suppresses repulsion for particle k when its
+    task loss diverges from the healthy reference, preventing basin escape.
 
     Gradients flow separately via detach trick:
-      d_fwd = (pred_0 - pred_1.detach())^2  → grad to pred_0 / lora_0
-      d_rev = (pred_0.detach() - pred_1)^2  → grad to pred_1 / lora_1
-
-    Returns (loss_rep scalar, kernel_value float for logging).
-    Only called when λ > 0, so the computation graph is never wasted.
+      d_fwd → grad to pred_0 / lora_0, scaled by gate_0
+      d_rev → grad to pred_1 / lora_1, scaled by gate_1
     """
     p0 = pred_0.reshape(pred_0.shape[0], -1).float()  # (B, D)
     p1 = pred_1.reshape(pred_1.shape[0], -1).float()  # (B, D)
@@ -209,9 +213,8 @@ def compute_repulsion(
 
     k_fwd = torch.exp(-d_fwd / h_safe)
     k_rev = torch.exp(-d_rev / h_safe)
-    loss_rep = (k_fwd + k_rev) * 0.5
+    loss_rep = (gate_0 * k_fwd + gate_1 * k_rev) * 0.5
 
-    # detached kernel value for logging
     with torch.no_grad():
         d_sym = ((p0 - p1) ** 2).sum(dim=1).mean()
         k_val = float(torch.exp(-d_sym / h_safe))
@@ -541,6 +544,7 @@ def train(cfg: SVGDEnsembleConfig) -> None:
         "task_loss_diff", "loss_repulsion", "kernel_value",
         "dist_sq", "h_ema", "lambda", "pred_diversity",
         "grad_norm_lora_0", "grad_norm_lora_1",
+        "gate_0", "gate_1",
     ]
     recent: Dict[str, deque] = {k: deque(maxlen=cfg.wandb_log_freq) for k in metric_keys}
 
@@ -599,7 +603,18 @@ def train(cfg: SVGDEnsembleConfig) -> None:
             loss_task_sum = sum(task_losses)
 
             if lam > 0.0:
-                loss_rep, k_val = compute_repulsion(all_preds[0], all_preds[1], h_ema)
+                # Task-gated repulsion: gate_k→0 when particle k's loss deviates
+                with torch.no_grad():
+                    ref = max(min(task_losses[0].item(), task_losses[1].item()), 1e-8)
+                    gate_0_val = float(torch.sigmoid(torch.tensor(
+                        -cfg.gate_beta * (task_losses[0].item() / ref - cfg.gate_threshold)
+                    )))
+                    gate_1_val = float(torch.sigmoid(torch.tensor(
+                        -cfg.gate_beta * (task_losses[1].item() / ref - cfg.gate_threshold)
+                    )))
+                loss_rep, k_val = compute_repulsion(
+                    all_preds[0], all_preds[1], h_ema, gate_0_val, gate_1_val
+                )
                 # 动态限制：repulsion 最多占 task loss 的 rep_fraction_cap
                 with torch.no_grad():
                     max_lam = cfg.rep_fraction_cap * loss_task_sum.item() / max(loss_rep.item(), 1e-8)
@@ -609,6 +624,7 @@ def train(cfg: SVGDEnsembleConfig) -> None:
                 loss_rep = torch.zeros(1, device=all_preds[0].device)
                 k_val = float(torch.exp(torch.tensor(-d_sq_val / max(h_ema, 1e-6))))
                 lam_eff = 0.0
+                gate_0_val = gate_1_val = 1.0
                 loss_total = loss_task_sum / cfg.grad_accum_steps
 
             loss_total.backward()
@@ -642,13 +658,16 @@ def train(cfg: SVGDEnsembleConfig) -> None:
                 recent["pred_diversity"].append(diversity)
                 recent["grad_norm_lora_0"].append(gn0)
                 recent["grad_norm_lora_1"].append(gn1)
+                recent["gate_0"].append(gate_0_val)
+                recent["gate_1"].append(gate_1_val)
 
                 pbar.update()
                 pbar.set_postfix({
                     "t0": f"{loss_t0:.4f}",
                     "t1": f"{loss_t1:.4f}",
+                    "g0": f"{gate_0_val:.2f}",
+                    "g1": f"{gate_1_val:.2f}",
                     "rep": f"{loss_rep.item():.4f}",
-                    "div": f"{diversity:.4f}",
                     "λ": f"{lam_eff:.3f}",
                 })
 
@@ -664,6 +683,7 @@ def train(cfg: SVGDEnsembleConfig) -> None:
                         f"rep={log['loss_repulsion']:.4f}  "
                         f"k={log['kernel_value']:.4f}  h={log['h_ema']:.4f}  "
                         f"λ_eff={log['lambda']:.3f}(cap={cfg.rep_fraction_cap})  div={log['pred_diversity']:.4f}  "
+                        f"g0={log['gate_0']:.3f}  g1={log['gate_1']:.3f}  "
                         f"lr={current_lr:.2e}  ({log['steps_per_sec']:.2f} it/s)"
                     )
                     if cfg.use_wandb:
