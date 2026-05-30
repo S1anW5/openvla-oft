@@ -627,7 +627,7 @@ def train(cfg: SVGDEnsembleConfig) -> None:
                 loss_total = (loss_task_sum + lam_eff * loss_rep) / cfg.grad_accum_steps
             else:
                 loss_rep = torch.zeros(1, device=all_preds[0].device)
-                k_val = float(torch.exp(torch.tensor(-d_sq_val / max(h_ema, 1e-6))))
+                k_val = math.exp(-d_sq_val / max(h_ema, 1e-6))
                 lam_eff = 0.0
                 gate_0_val = gate_1_val = 1.0
                 loss_total = loss_task_sum / cfg.grad_accum_steps
@@ -679,7 +679,7 @@ def train(cfg: SVGDEnsembleConfig) -> None:
                 if global_step % cfg.wandb_log_freq == 0:
                     log = {k: sum(v) / len(v) for k, v in recent.items() if v}
                     log["lr"] = current_lr
-                    log["steps_per_sec"] = global_step / (time.time() - t0)
+                    log["steps_per_sec"] = (global_step - start_step) / (time.time() - t0 + 1e-8)
                     print(
                         f"[{global_step:6d}/{cfg.max_steps}] "
                         f"task={log['loss_task']:.4f} "
@@ -696,8 +696,8 @@ def train(cfg: SVGDEnsembleConfig) -> None:
                         wandb.log({f"train/{k}": v for k, v in log.items()},
                                   step=global_step)
 
-                # Sanity check at step 100: B should be non-zero after 100 effective steps
-                if global_step == 100:
+                # Sanity check: at step 100 (first run) or first step after resume
+                if global_step == 100 or (cfg.resume_dir and global_step == start_step + 1):
                     sanity_check_diversity(
                         vla, [action_head, action_head], [proprio_projector, proprio_projector],
                         batch, device_id, NUM_PATCHES, cfg.use_proprio, global_step,
