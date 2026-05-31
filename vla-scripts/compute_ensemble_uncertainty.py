@@ -81,6 +81,7 @@ class EnsembleUncertaintyConfig:
     checkpoint_dir_0: str = ""   # lora_0 checkpoint 目录 → GPU 0
     checkpoint_dir_1: str = ""   # lora_1 checkpoint 目录 → GPU 1
     preds_dir: str = ""          # 中间 .npy 文件保存目录（默认与 output_path 同级）
+    max_episodes: int = -1       # 最多处理的 episode 数（-1=全量）
 
     # merge 模式参数
     pred_files: List[str] = field(default_factory=list)       # 各成员的 .npy 预测文件列表
@@ -378,7 +379,7 @@ def run_dual_infer(cfg: EnsembleUncertaintyConfig):
     print(f"Dataset: {num_transitions} frames across {num_episodes} episodes")
 
     all_preds_0, all_preds_1 = [], []
-    episode_indices_list, step_indices_list, task_names_list = [], [], []
+    episode_indices_list, step_indices_list, task_names_list, gripper_states_list = [], [], [], []
     episode_idx = 0
     prev_step = None
 
@@ -393,10 +394,20 @@ def run_dual_infer(cfg: EnsembleUncertaintyConfig):
 
         if prev_step is not None and current_step == 0:
             episode_idx += 1
+            if cfg.max_episodes > 0 and episode_idx >= cfg.max_episodes:
+                break
         prev_step = current_step
         episode_indices_list.append(episode_idx)
         step_indices_list.append(current_step)
         task_names_list.append(task_name)
+
+        # gripper state: proprio dim 6 (gripper width), or NaN if not available
+        proprio = batch.get("proprio", None)
+        if proprio is not None:
+            p = proprio.squeeze()
+            gripper_states_list.append(float(p[6]) if p.ndim >= 1 and p.shape[-1] > 6 else float('nan'))
+        else:
+            gripper_states_list.append(float('nan'))
 
         all_preds_0.append(run_inference_on_batch(vla_0, ah_0, batch, cfg.unnorm_key, device))
         all_preds_1.append(run_inference_on_batch(vla_1, ah_1, batch, cfg.unnorm_key, device))
@@ -420,6 +431,7 @@ def run_dual_infer(cfg: EnsembleUncertaintyConfig):
         step_indices=np.array(step_indices_list),
         task_names=np.array(task_names_list, dtype=object),
         variances=variances,
+        gripper_states=np.array(gripper_states_list, dtype=np.float32),
     )
     print(f"Saved: {cfg.output_path}")
 
